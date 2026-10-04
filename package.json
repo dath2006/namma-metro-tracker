@@ -1,0 +1,31 @@
+{
+  "name": "namma-metro-tracker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "check": "node --no-warnings scripts/check-engine.mjs",
+    "data": "node scripts/build-data.mjs",
+    "prebuild": "node -e \"require('fs').cpSync('node_modules/maplibre-gl/dist/maplibre-gl-worker.mjs','public/maplibre/maplibre-gl-worker.mjs');require('fs').cpSync('node_modules/maplibre-gl/dist/maplibre-gl-shared.mjs','public/maplibre/maplibre-gl-shared.mjs')\"",
+    "predev": "node -e \"require('fs').cpSync('node_modules/maplibre-gl/dist/maplibre-gl-worker.mjs','public/maplibre/maplibre-gl-worker.mjs');require('fs').cpSync('node_modules/maplibre-gl/dist/maplibre-gl-shared.mjs','public/maplibre/maplibre-gl-shared.mjs')\""
+  },
+  "dependencies": {
+    "maplibre-gl": "^6.12.0",
+    "next": "16.3.8",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.8",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

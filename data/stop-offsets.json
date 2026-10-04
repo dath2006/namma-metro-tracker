@@ -1,0 +1,4 @@
+{
+  "_doc": "Metres along the line (positive = toward the last station, i.e. the direction of increasing chainage) to shift where a rake stops, for stations whose OSM node is not at the platform centre. Measure against satellite imagery.",
+  "HSLI": -25
+}

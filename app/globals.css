@@ -1,0 +1,7 @@
+@import "tailwindcss";
+
+html, body { height: 100%; margin: 0; background: #0b0d14; color: #e8e9f0; }
+body { font-family: ui-sans-serif, system-ui, "Segoe UI", Inter, sans-serif; }
+.glass { background: rgba(14, 16, 26, 0.78); backdrop-filter: blur(14px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px; }
+.maplibregl-ctrl-attrib { background: rgba(14, 16, 26, 0.7) !important; color: #aab !important; }
+.maplibregl-ctrl-attrib a { color: #ccd !important; }
