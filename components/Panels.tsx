@@ -141,7 +141,7 @@ export function TrackPrompt({ t, line, onStart, onShuffle, onDismiss }: { t: Tra
 /** Small reminder once the prompt is dismissed and nothing is being tracked. */
 export function TrackHint({ onRandom }: { onRandom: () => void }) {
   return (
-    <div className="glass absolute bottom-16 left-2 flex items-center gap-3 px-4 py-2 text-xs text-white/70 sm:bottom-4 sm:left-1/2 sm:-translate-x-1/2">
+    <div className="glass absolute bottom-16 left-2 flex items-center gap-3 px-4 py-2 text-xs text-white/70 sm:bottom-4 sm:left-auto sm:right-20">
       Tap any train to track it
       <button onClick={onRandom} className="rounded-md bg-white/10 px-2 py-1 text-white hover:bg-white/15">Track a random train</button>
     </div>

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
 import type { Line, Network } from '@/lib/network';
 import { createSim, lateralAt, RAKE_LEN, setTrackOffset } from '@/lib/engine';
 import { applyOverrides, buildPath, DEFAULT_TRACK_OFFSET, sparse, vertexOffsets, type LineOverride, type Overrides } from '@/lib/overrides';

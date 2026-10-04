@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css'; // here, not in the layout, so the plain SEO pages do not load it
 import type { Network } from '@/lib/network';
 import { CONFIG, createSim, inTunnel, lateralAt, setTrackOffset, type Sim, type TrainState } from '@/lib/engine';
 import { applyOverrides, DEFAULT_TRACK_OFFSET, type Overrides } from '@/lib/overrides';
@@ -115,11 +116,18 @@ export default function MetroMap() {
     const idx = Object.fromEntries(net.lines.map((l, i) => [l.id, i]));
     const c = ctl.current;
     c.clock = Date.now();
+    // Deep links from the station and line pages: /?station=KGWA or /?line=purple
+    const q = new URLSearchParams(window.location.search);
+    const st = net.lines.flatMap((l) => l.stations).find((x) => x.code === q.get('station'));
+    const ln = net.lines.find((l) => l.id === q.get('line'));
+    const mid = ln?.stations[Math.floor(ln.stations.length / 2)];
+    const view: { center: [number, number]; zoom: number; pitch: number } = st
+      ? { center: [st.lon, st.lat], zoom: 16.4, pitch: 55 }
+      : mid ? { center: [mid.lon, mid.lat], zoom: 11.2, pitch: 30 } : { center: [77.5946, 12.9716], zoom: 11.8, pitch: 30 };
+    if (st) c.prompt = false; // they came for a specific place, not a random train
     const map = new maplibregl.Map({
       container: el.current,
-      center: [77.5946, 12.9716],
-      zoom: 11.8,
-      pitch: 30,
+      ...view,
       maxPitch: 85,
       attributionControl: { compact: true },
       style: satStyle(),
@@ -132,7 +140,9 @@ export default function MetroMap() {
 
     let raf = 0;
     let lastTrains: TrainState[] = [];
-    map.once('style.load', () => { // not 'load': that waits for every satellite tile, so slow imagery would delay the overlay
+    map.once('style.load', () => {
+      if (st) setPromptOpen(false);
+      // style.load, not 'load': that waits for every satellite tile, so slow imagery would delay the overlay
       const open = ['==', ['get', 'open'], true];
       const w = (a: number, b: number) => ['interpolate', ['linear'], ['zoom'], 10, a, 17, b];
       // Underground stretches, sampled from the track every 20 m.
