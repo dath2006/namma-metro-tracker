@@ -4,10 +4,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css'; // here, not in the layout, so the plain SEO pages do not load it
 import type { Network } from '@/lib/network';
+import type { Bus } from '@/lib/bus';
+import { nextStop, prepare, simBuses, type BusRoute, type BusView } from '@/lib/busSim';
+import pilot from '@/data/bus-pilot.json';
 import { CONFIG, createSim, inTunnel, lateralAt, setTrackOffset, type Sim, type TrainState } from '@/lib/engine';
 import { applyOverrides, DEFAULT_TRACK_OFFSET, type Overrides } from '@/lib/overrides';
 import { canon, R, RAD, satStyle, sideOf } from '@/lib/geo';
-import { ClockBar, Header, LineStrip, TrackHint, TrackPrompt, TrainCard, type CamMode, type Theme } from './Panels';
+import { BusCard, ClockBar, Header, LineStrip, TrackHint, TrackPrompt, TrainCard, type BusSel, type CamMode, type Theme } from './Panels';
 
 maplibregl.setWorkerUrl('/maplibre/maplibre-gl-worker.mjs'); // Turbopack can't bundle the worker; served from public/ (copied by predev/prebuild)
 
@@ -24,6 +27,20 @@ const PRESET: Record<Exclude<CamMode, 'free'>, { zoom: number; pitch: number }> 
   top: { zoom: 17.2, pitch: 0 },
   orbit: { zoom: 18.1, pitch: 62 },
 };
+type Mode = 'both' | 'metro' | 'bus';
+const MODES: [Mode, string][] = [['both', 'Combined'], ['metro', 'Metro only'], ['bus', 'Bus only']];
+const BUS_POLL = 15_000; // ms; the API refreshes a bus's GPS roughly this often, and the server caches for 10 s
+const PILOT_ROUTES = Object.values(pilot as Record<string, string>);
+const ago = (ms: number) => { const m = Math.round((Date.now() - ms) / 60_000); return m < 1 ? 'just now' : `${m} min ago`; };
+// A bus is ~11.5 x 2.55 m, so the follow-camera sits much closer than for a 136 m rake.
+const BUS_PRESET: Record<Exclude<CamMode, 'free'>, { zoom: number; pitch: number }> = {
+  chase: { zoom: 19.3, pitch: 66 },
+  cockpit: { zoom: 20.4, pitch: 80 },
+  top: { zoom: 18.8, pitch: 0 },
+  orbit: { zoom: 19.3, pitch: 62 },
+};
+const BUS_LEN = 11.5, BUS_HW = 1.275;
+const BUS_LAYERS = ['bus3d-body', 'bus3d-stripe', 'bus3d-glass', 'bus3d-lamp'];
 const wrap = (d: number) => ((d + 540) % 360) - 180;
 
 // 0 = day, 1 = night, with 1 h ramps at dusk and dawn (IST).
@@ -62,6 +79,7 @@ const frame = (lon: number, lat: number, hdg: number) => {
 const rect = (pt: ReturnType<typeof frame>, df0: number, df1: number, dr0: number, dr1: number) => [pt(df0, dr0), pt(df1, dr0), pt(df1, dr1), pt(df0, dr1), pt(df0, dr0)];
 // Headlight cones: nested, widening slabs ahead of the cab. Stacked translucent layers read as a soft gradient.
 const BEAMS = [{ len: 80, w: 18 }, { len: 62, w: 14 }, { len: 46, w: 10 }, { len: 32, w: 7 }, { len: 20, w: 4.2 }];
+const METRO_LAYERS = ['line-glow', 'line-core', 'line-upcoming', 'tunnels', 'stations', 'station-labels', 'head-halo', 'head', 'head-label', 'rake-body', 'rake-stripe', 'rake-glass', 'rake-lamp', 'rake-door', ...BEAMS.map((_, i) => `beam-${i}`)];
 
 export default function MetroMap() {
   const el = useRef<HTMLDivElement>(null);
@@ -75,13 +93,28 @@ export default function MetroMap() {
   const [night, setNight] = useState(false);
   const [suggest, setSuggest] = useState<TrainState | null>(null); // randomly chosen train offered for tracking
   const [promptOpen, setPromptOpen] = useState(true);
+  const [mode, setModeState] = useState<Mode>('both');
+  const [busInfo, setBusInfo] = useState<{ n: number; err: boolean }>({ n: 0, err: false });
+  const [simN, setSimN] = useState(0);
+  const [selBus, setSelBus] = useState<BusSel | null>(null);
+  const [routeQ, setRouteQ] = useState('');
+  const [routeName, setRouteName] = useState('');
 
   // Mutable state read by the animation loop, kept out of React to avoid re-renders per frame.
   const ctl = useRef({
     speed: 1, cam: 'chase' as CamMode, following: false, settleUntil: 0, orbit: 0, theme: 'auto' as Theme,
     selId: null as string | null, clock: 0, map: null as maplibregl.Map | null,
     prompt: true, suggestId: null as string | null, track: null as ((id: string) => void) | null,
+    mode: 'both' as Mode, applyMode: null as ((m: Mode) => void) | null,
+    buses: [] as { b: Bus; from: [number, number]; cur: [number, number]; v: number }[], busAt: 0, polled: false, selBusId: null as string | null, hd: new Map<string, number>(),
+    routes: null as Record<string, BusRoute> | null, route: null as string | null, simN: 0, setRoute: null as ((no: string) => void) | null,
   });
+  const setMode = (m: Mode) => {
+    const c = ctl.current;
+    c.mode = m; setModeState(m); c.applyMode?.(m);
+    if (m === 'metro' && c.selBusId) { c.selBusId = null; setSelBus(null); if (!c.selId) c.following = false; }
+  };
+  const closeBus = () => { const c = ctl.current; c.selBusId = null; c.following = false; setSelBus(null); };
   const setSpeed = (n: number) => { ctl.current.speed = n; setSpeedState(n); };
   const setTheme = (t: Theme) => { ctl.current.theme = t; setThemeState(t); };
   const setCam = (m: CamMode) => {
@@ -139,7 +172,9 @@ export default function MetroMap() {
     map.on('dragstart', () => { if (c.following) { c.following = false; c.cam = 'free'; setCamState('free'); } });
 
     let raf = 0;
+    const cleanup: (() => void)[] = [];
     let lastTrains: TrainState[] = [];
+    let lastBuses: BusView[] = [];
     map.once('style.load', () => {
       if (st) setPromptOpen(false);
       // style.load, not 'load': that waits for every satellite tile, so slow imagery would delay the overlay
@@ -162,6 +197,94 @@ export default function MetroMap() {
       map.addLayer({ id: 'tunnels', type: 'line', source: 'tunnels', paint: { 'line-color': '#0b0d14', 'line-width': w(4, 4) as never, 'line-opacity': 0.8, 'line-dasharray': [1, 1.5] } });
       map.addLayer({ id: 'stations', type: 'circle', source: 'stations', paint: { 'circle-radius': w(3, 7) as never, 'circle-color': ['case', open as never, '#fff', '#222'], 'circle-stroke-color': ['get', 'color'], 'circle-stroke-width': w(1.5, 3) as never } });
 
+      // Live BMTC buses (pilot routes). Positions come from /api/buses and glide between polls.
+      map.addSource('bus-routes', { type: 'geojson', data: empty });
+      map.addSource('bus-stops', { type: 'geojson', data: empty });
+      map.addSource('buses', { type: 'geojson', data: empty });
+      map.addLayer({ id: 'bus-line', type: 'line', source: 'bus-routes', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#f59e0b', 'line-width': ['case', ['get', 'sel'], 4, 1.5], 'line-opacity': ['case', ['get', 'sel'], 0.9, 0.35] } });
+      map.addLayer({ id: 'bus-stops', type: 'circle', source: 'bus-stops', minzoom: 12.5, paint: { 'circle-radius': w(2.5, 5) as never, 'circle-color': '#fff', 'circle-stroke-color': '#f59e0b', 'circle-stroke-width': 1.5 } });
+      map.addLayer({ id: 'bus-stop-label', type: 'symbol', source: 'bus-stops', minzoom: 14.5, layout: { 'text-field': ['get', 'name'], 'text-font': ['Open Sans Regular,Arial Unicode MS Regular'], 'text-size': 11, 'text-offset': [0, 1.1], 'text-anchor': 'top', 'text-optional': true }, paint: { 'text-color': '#fff', 'text-halo-color': 'rgba(8,10,18,0.9)', 'text-halo-width': 1.5 } });
+      map.addLayer({ id: 'bus', type: 'circle', source: 'buses', paint: { 'circle-radius': w(4, 8) as never, 'circle-color': ['case', ['get', 'ac'], '#22d3ee', '#f59e0b'], 'circle-opacity': ['case', ['get', 'sim'], 0.6, 1], 'circle-stroke-color': ['case', ['get', 'sim'], '#fff', '#0b0d14'], 'circle-stroke-width': 1.5 } });
+      map.addLayer({ id: 'bus-label', type: 'symbol', source: 'buses', minzoom: 13, layout: { 'text-field': ['get', 'route'], 'text-font': ['Open Sans Regular,Arial Unicode MS Regular'], 'text-size': 11, 'text-offset': [0, -1.4], 'text-optional': true }, paint: { 'text-color': '#fff', 'text-halo-color': 'rgba(8,10,18,0.9)', 'text-halo-width': 1.5 } });
+      // 3D bus: body, livery stripe (cyan = AC, amber = ordinary), glazing and lamps. Dots below zoom 15, models above.
+      map.addSource('bus3d', { type: 'geojson', data: empty });
+      const bpart = (id: string, p: string, base: number, top: number, color: unknown) =>
+        map.addLayer({ id, type: 'fill-extrusion', source: 'bus3d', minzoom: 15, filter: ['==', ['get', 'part'], p], paint: { 'fill-extrusion-color': color as never, 'fill-extrusion-base': base, 'fill-extrusion-height': top, 'fill-extrusion-vertical-gradient': true } });
+      bpart('bus3d-body', 'body', 0.45, 3.3, ['case', ['get', 'sel'], '#f7f0d2', '#e8ebf2']);
+      bpart('bus3d-stripe', 'stripe', 0.9, 1.5, ['get', 'color']);
+      bpart('bus3d-glass', 'glass', 1.7, 2.9, '#101722');
+      bpart('bus3d-lamp', 'lamp', 0.7, 1.2, ['get', 'lc']);
+      map.setLayerZoomRange('bus', 0, 15); // the 3D model takes over
+
+      const trackBus = (v: BusView) => {
+        c.selBusId = v.id;
+        c.selId = null; setSel(null);
+        c.prompt = false; setPromptOpen(false); setSuggest(null);
+        c.following = false; // following starts once the fly-to lands
+        c.cam = 'chase'; setCamState('chase');
+        map.flyTo({ center: [v.lon, v.lat], zoom: Math.max(map.getZoom(), 18), pitch: 60, bearing: v.heading, duration: 2200 });
+        map.once('moveend', () => { if (c.selBusId === v.id && c.cam !== 'free') { c.following = true; c.settleUntil = performance.now() + 2200; c.orbit = map.getBearing(); } });
+      };
+      for (const l of ['bus', ...BUS_LAYERS]) {
+        map.on('mouseenter', l, () => (map.getCanvas().style.cursor = 'pointer'));
+        map.on('mouseleave', l, () => (map.getCanvas().style.cursor = ''));
+        map.on('click', l, (e) => {
+          const v = lastBuses.find((x) => x.id === e.features?.[0]?.properties?.id);
+          if (v) trackBus(v);
+        });
+      }
+      const poll = async () => {
+        if (c.mode === 'metro') return;
+        try {
+          const r = await fetch('/api/buses');
+          if (!r.ok) throw new Error(String(r.status));
+          const list = (await r.json()) as Bus[];
+          const prev = new Map(c.buses.map((x) => [x.b.id, x]));
+          c.buses = list.map((b) => {
+            const o = prev.get(b.id);
+            const from = o?.cur ?? ([b.lon, b.lat] as [number, number]);
+            let v = o?.v ?? 0; // m/s from the last two GPS fixes: the feed has no speed field
+            if (o && b.ts > o.b.ts) v = Math.min(28, (Math.hypot((b.lon - o.b.lon) * Math.cos(b.lat * RAD), b.lat - o.b.lat) * RAD * R) / ((b.ts - o.b.ts) / 1000));
+            return { b, from, cur: from, v };
+          });
+          c.busAt = performance.now();
+          c.polled = true;
+          setBusInfo({ n: list.length, err: false });
+        } catch { c.polled = true; setBusInfo((i) => ({ ...i, err: true })); } // keep showing the last known positions
+      };
+      const drawRoutes = () => {
+        if (!c.routes) return;
+        const all = Object.values(c.routes);
+        const seen = new Set<string>();
+        (map.getSource('bus-routes') as maplibregl.GeoJSONSource).setData({ type: 'FeatureCollection', features: all.flatMap((r) => r.dirs.map((d) => ({ type: 'Feature', properties: { sel: r.no === c.route }, geometry: { type: 'LineString', coordinates: d.shape } }))) } as never);
+        const stops = all.find((r) => r.no === c.route)?.dirs.flatMap((d) => d.stops) ?? []; // stops only for the selected route, else the map drowns in dots
+        (map.getSource('bus-stops') as maplibregl.GeoJSONSource).setData({ type: 'FeatureCollection', features: stops.filter((x) => !seen.has(x.n + x.lon) && seen.add(x.n + x.lon)).map((x) => ({ type: 'Feature', properties: { name: x.n }, geometry: { type: 'Point', coordinates: [x.lon, x.lat] } })) } as never);
+      };
+      let staticLoaded = false;
+      const loadStatic = () => {
+        if (staticLoaded) return;
+        staticLoaded = true;
+        fetch('/data/bus.json').then((r) => r.json()).then((j) => { c.routes = prepare(j); drawRoutes(); }).catch(() => { staticLoaded = false; });
+      };
+      c.setRoute = (no) => {
+        c.route = no || null;
+        const r = c.routes && Object.values(c.routes).find((x) => x.no === no);
+        setRouteName(r?.name ?? '');
+        drawRoutes();
+        if (r) {
+          const pts = r.dirs.flatMap((d) => d.shape);
+          const b = pts.reduce((bb, p) => bb.extend(p as [number, number]), new maplibregl.LngLatBounds(pts[0] as [number, number], pts[0] as [number, number]));
+          map.fitBounds(b, { padding: { top: 150, bottom: 70, left: 60, right: 60 }, maxZoom: 14, pitch: 0, bearing: 0, duration: 1500 });
+        }
+      };
+      const pollTimer = setInterval(poll, BUS_POLL);
+      c.applyMode = (m) => {
+        METRO_LAYERS.forEach((id) => map.setLayoutProperty(id, 'visibility', m === 'bus' ? 'none' : 'visible'));
+        ['bus-line', 'bus-stops', 'bus-stop-label', 'bus', 'bus-label', ...BUS_LAYERS].forEach((id) => map.setLayoutProperty(id, 'visibility', m === 'metro' ? 'none' : 'visible'));
+        if (m !== 'metro') { loadStatic(); poll(); }
+      };
+      cleanup.push(() => { clearInterval(pollTimer); c.applyMode = null; });
+
       // Headlight cones sit at cab height, under the rake layers. Opacity is driven by the night factor (applyTheme).
       BEAMS.forEach((_, i) => map.addLayer({ id: `beam-${i}`, type: 'fill-extrusion', source: 'beams', minzoom: 15, filter: ['==', ['get', 'lvl'], i], paint: { 'fill-extrusion-color': '#fff3c4', 'fill-extrusion-base': VIADUCT_M + 1.25, 'fill-extrusion-height': VIADUCT_M + 1.3, 'fill-extrusion-opacity': 0, 'fill-extrusion-vertical-gradient': false } }));
 
@@ -181,6 +304,7 @@ export default function MetroMap() {
 
       const track = (t: TrainState) => {
         c.selId = t.id;
+        c.selBusId = null; setSelBus(null);
         c.prompt = false; setPromptOpen(false); setSuggest(null);
         c.following = false; // a per-frame jumpTo would cancel the fly-to, so following starts when it lands
         c.cam = 'chase'; setCamState('chase');
@@ -204,7 +328,35 @@ export default function MetroMap() {
         map.setPaintProperty('sat', 'raster-saturation', -0.1 - 0.3 * f);
         map.setPaintProperty('rake-body', 'fill-extrusion-color', ['case', ['get', 'sel'], mix('#f7f0d2', '#a39f86', f), mix('#e8ebf2', '#8f97ab', f)]);
         map.setPaintProperty('rake-glass', 'fill-extrusion-color', mix('#101722', '#ffe29a', f)); // lit windows at night
+        map.setPaintProperty('bus3d-body', 'fill-extrusion-color', ['case', ['get', 'sel'], mix('#f7f0d2', '#a39f86', f), mix('#e8ebf2', '#8f97ab', f)]);
+        map.setPaintProperty('bus3d-glass', 'fill-extrusion-color', mix('#101722', '#ffe29a', f));
         BEAMS.forEach((_, i) => map.setPaintProperty(`beam-${i}`, 'fill-extrusion-opacity', Math.max(0, f - 0.15) * 0.16));
+      };
+
+      // Eases the camera towards a look-at point and bearing; zoom/pitch settle to the preset for the first moments of a follow.
+      const steer = (target: [number, number], tb: number, pre: { zoom: number; pitch: number }, dt: number, now: number, zoom: number) => {
+        const settling = now < c.settleUntil;
+        const cur = map.getCenter();
+        const kc = settling ? 1 - Math.exp(-dt * 7) : 1;
+        const kb = 1 - Math.exp(-dt * (settling ? 3 : 2.5));
+        const kz = 1 - Math.exp(-dt * 3);
+        map.jumpTo({
+          center: [cur.lng + (target[0] - cur.lng) * kc, cur.lat + (target[1] - cur.lat) * kc],
+          bearing: map.getBearing() + wrap(tb - map.getBearing()) * kb,
+          ...(settling ? { zoom: zoom + (pre.zoom - zoom) * kz, pitch: map.getPitch() + (pre.pitch - map.getPitch()) * kz } : {}),
+        });
+      };
+      const busParts = (v: BusView, sel: boolean) => {
+        const pt = frame(v.lon, v.lat, v.heading), hl = BUS_LEN / 2;
+        const props = { id: v.id, sel, color: v.ac ? '#22d3ee' : '#f59e0b' };
+        const out: unknown[] = [];
+        for (const [part, hw] of [['body', BUS_HW], ['stripe', BUS_HW + 0.02], ['glass', BUS_HW + 0.04]] as const)
+          out.push({ type: 'Feature', properties: { ...props, part }, geometry: { type: 'Polygon', coordinates: [rect(pt, -hl, hl, -hw, hw)] } });
+        for (const sgn of [-1, 1]) {
+          out.push({ type: 'Feature', properties: { ...props, part: 'lamp', lc: '#fff7d6' }, geometry: { type: 'Polygon', coordinates: [rect(pt, hl - 0.12, hl + 0.1, sgn * 0.6, sgn * 1.0)] } });
+          out.push({ type: 'Feature', properties: { ...props, part: 'lamp', lc: '#ff3030' }, geometry: { type: 'Polygon', coordinates: [rect(pt, -hl - 0.1, -hl + 0.12, sgn * 0.6, sgn * 1.0)] } });
+        }
+        return out;
       };
 
       let last = performance.now(), lastDraw = last, lastUi = 0, lastF = -1;
@@ -214,11 +366,11 @@ export default function MetroMap() {
         if (now - lastDraw > 33) { // ~30 fps map updates
           const dt = (now - lastDraw) / 1000;
           lastDraw = now;
-          const trains = (lastTrains = sim.getTrains(c.clock));
+          const trains = (lastTrains = c.mode === 'bus' ? [] : sim.getTrains(c.clock));
           const zoom = map.getZoom();
           const b = map.getBounds();
           const pad = 0.004;
-          const seen = (t: TrainState) => t.lon > b.getWest() - pad && t.lon < b.getEast() + pad && t.lat > b.getSouth() - pad && t.lat < b.getNorth() + pad;
+          const seen = (t: { lon: number; lat: number }) => t.lon > b.getWest() - pad && t.lon < b.getEast() + pad && t.lat > b.getSouth() - pad && t.lat < b.getNorth() + pad;
           const rakes: unknown[] = [];
           const heads: unknown[] = [];
           const beams: unknown[] = [];
@@ -260,30 +412,64 @@ export default function MetroMap() {
           (map.getSource('heads') as maplibregl.GeoJSONSource).setData({ type: 'FeatureCollection', features: heads } as never);
           (map.getSource('beams') as maplibregl.GeoJSONSource).setData({ type: 'FeatureCollection', features: beams } as never);
 
+          if (c.mode !== 'metro') {
+            const k = Math.min(1, (now - c.busAt) / BUS_POLL);
+            const live = new Set<string>();
+            const vs: BusView[] = [];
+            // Heading eases towards the reported one so buses swing round corners instead of snapping.
+            const hdOf = (id: string, target: number) => {
+              const h = c.hd.get(id) ?? target, n = (h + wrap(target - h) * (1 - Math.exp(-dt * 4)) + 360) % 360;
+              c.hd.set(id, n);
+              return n;
+            };
+            for (const x of c.buses) {
+              live.add(x.b.route);
+              if (c.route && x.b.route !== c.route) continue;
+              x.cur = [x.from[0] + (x.b.lon - x.from[0]) * k, x.from[1] + (x.b.lat - x.from[1]) * k];
+              const id = `bus-${x.b.id}`;
+              vs.push({ id, route: x.b.route, reg: x.b.reg, ac: x.b.ac, sim: false, lon: x.cur[0], lat: x.cur[1], heading: hdOf(id, x.b.heading), speed: x.v, ts: x.b.ts, next: '', head: '' });
+            }
+            // Routes with no live GPS at all fall back to the timetable. Estimate only: the feed also misses buses that are running.
+            const fallback = c.routes && c.polled ? Object.values(c.routes).filter((r) => !live.has(r.no) && (!c.route || r.no === c.route)) : []; // after the first poll, else every route looks empty
+            const sims = simBuses(fallback, c.clock);
+            for (const x of sims) vs.push({ id: x.id, route: x.route, reg: '', ac: false, sim: true, lon: x.lon, lat: x.lat, heading: hdOf(x.id, x.heading), speed: x.speed, ts: 0, next: x.next, head: x.head });
+            if (c.hd.size > 3000) c.hd.clear();
+            lastBuses = vs;
+            c.simN = sims.length;
+            (map.getSource('buses') as maplibregl.GeoJSONSource).setData({ type: 'FeatureCollection', features: vs.map((v) => ({ type: 'Feature', properties: { id: v.id, route: v.route, ac: v.ac, sim: v.sim }, geometry: { type: 'Point', coordinates: [v.lon, v.lat] } })) } as never);
+            const models: unknown[] = [];
+            if (zoom >= 15) for (const v of vs) if (seen(v)) models.push(...busParts(v, v.id === c.selBusId));
+            (map.getSource('bus3d') as maplibregl.GeoJSONSource).setData({ type: 'FeatureCollection', features: models } as never);
+          }
+
           const st = trains.find((t) => t.id === c.selId);
           if (c.selId && !st) { c.selId = null; c.following = false; }
           if (st && c.following && c.cam !== 'free') {
             const li = idx[st.line];
-            const settling = now < c.settleUntil;
             const ahead = c.cam === 'cockpit' ? 30 : c.cam === 'chase' ? -66 : 0; // look-at point along the rake
             const [clon, clat] = sim.posAt(li, st.chainage + st.dir * ahead);
             const target: [number, number] = sideOf(clon, clat, canon(st), lateralAt(st, st.chainage + st.dir * ahead));
-            const cur = map.getCenter();
-            const kc = settling ? 1 - Math.exp(-dt * 7) : 1;
             const tb = c.cam === 'top' ? 0 : c.cam === 'orbit' ? (c.orbit = (c.orbit + 8 * dt) % 360) : st.bearing;
-            const kb = 1 - Math.exp(-dt * (settling ? 3 : 2.5));
-            const pre = PRESET[c.cam];
-            const kz = 1 - Math.exp(-dt * 3);
-            map.jumpTo({
-              center: [cur.lng + (target[0] - cur.lng) * kc, cur.lat + (target[1] - cur.lat) * kc],
-              bearing: map.getBearing() + wrap(tb - map.getBearing()) * kb,
-              ...(settling ? { zoom: zoom + (pre.zoom - zoom) * kz, pitch: map.getPitch() + (pre.pitch - map.getPitch()) * kz } : {}),
-            });
+            steer(target, tb, PRESET[c.cam], dt, now, zoom);
+          }
+          const sb = c.selBusId ? lastBuses.find((v) => v.id === c.selBusId) : undefined;
+          if (c.selBusId && !sb) { c.selBusId = null; c.following = false; } // the bus left the feed
+          if (sb && c.following && c.cam !== 'free') {
+            const ahead = c.cam === 'cockpit' ? 8 : c.cam === 'chase' ? -20 : 0; // look-at point along the bus, metres
+            const target = frame(sb.lon, sb.lat, sb.heading)(ahead, 0);
+            const tb = c.cam === 'top' ? 0 : c.cam === 'orbit' ? (c.orbit = (c.orbit + 8 * dt) % 360) : sb.heading;
+            steer(target, tb, BUS_PRESET[c.cam], dt, now, zoom);
           }
           if (now - lastUi > 250) { // React state at 4 Hz
             lastUi = now;
             setClock(fmt(c.clock));
+            setSimN(c.simN);
             setSel(st ?? null);
+            if (sb) {
+              const r = !sb.sim && c.routes ? Object.values(c.routes).find((x) => x.no === sb.route) : undefined;
+              const ns = r ? nextStop(r, sb.lon, sb.lat, sb.heading) : null;
+              setSelBus({ ...sb, next: ns?.name ?? sb.next, head: ns?.head ?? sb.head, dist: ns?.dist, age: sb.ts ? ago(sb.ts) : '' });
+            } else setSelBus(null);
             if (c.prompt && !c.selId) {
               // keep a valid random suggestion: running, above ground, not mid-turnback
               let pick = trains.find((x) => x.id === c.suggestId);
@@ -304,9 +490,10 @@ export default function MetroMap() {
         raf = requestAnimationFrame(tick);
       };
       raf = requestAnimationFrame(tick);
+      c.applyMode?.(c.mode);
     });
 
-    return () => { cancelAnimationFrame(raf); map.remove(); c.map = null; };
+    return () => { cancelAnimationFrame(raf); cleanup.forEach((f) => f()); map.remove(); c.map = null; };
   }, [net, sim]);
 
   const selLine = sel && net ? net.lines.find((l) => l.id === sel.line) : null;
@@ -315,12 +502,40 @@ export default function MetroMap() {
       {/* inline style: maplibre.css sets position:relative, which would collapse the height */}
       <div ref={el} style={{ position: 'absolute', inset: 0 }} />
       {net && <Header net={net} onPick={(lon, lat) => { ctl.current.following = false; ctl.current.map?.flyTo({ center: [lon, lat], zoom: 16.5, pitch: 55, duration: 1800 }); }} />}
+      <div className="glass absolute left-2 top-[4.6rem] flex gap-1 p-1 text-xs sm:left-1/2 sm:top-4 sm:-translate-x-1/2">
+        {MODES.map(([m, label]) => (
+          <button key={m} onClick={() => setMode(m)} aria-pressed={mode === m} className={`rounded-md px-2.5 py-1.5 ${mode === m ? 'bg-white/20' : 'bg-white/5 hover:bg-white/10'}`}>{label}</button>
+        ))}
+        {mode !== 'metro' && <span className="flex items-center gap-1.5 px-1.5 text-white/60"><i className={`h-2 w-2 rounded-full ${busInfo.err ? 'bg-red-400' : 'bg-cyan-400'}`} />{busInfo.err ? 'Bus feed down' : `${busInfo.n} live${simN ? ` · ${simN} scheduled` : ''}`}</span>}
+      </div>
+      {mode !== 'metro' && (
+        <div className="glass absolute left-2 top-[7.6rem] flex max-w-[calc(100vw-1rem)] items-center gap-2 p-1.5 text-xs sm:left-1/2 sm:top-16 sm:-translate-x-1/2">
+          <input
+            list="bus-route-list"
+            value={routeQ}
+            placeholder="Bus route, e.g. 500-D"
+            aria-label="Bus route"
+            onChange={(e) => {
+              const v = e.target.value;
+              setRouteQ(v);
+              const no = PILOT_ROUTES.find((r) => r.toLowerCase() === v.trim().toLowerCase());
+              if (no) ctl.current.setRoute?.(no);
+              else if (!v) ctl.current.setRoute?.('');
+            }}
+            className="w-40 rounded-md bg-white/5 px-2.5 py-1.5 outline-none placeholder:text-white/40 focus:bg-white/10"
+          />
+          <datalist id="bus-route-list">{PILOT_ROUTES.map((r) => <option key={r} value={r} />)}</datalist>
+          {routeName && <span className="hidden max-w-64 truncate text-white/60 sm:block">{routeName}</span>}
+        </div>
+      )}
       <ClockBar clock={clock} speed={speed} setSpeed={setSpeed} jump={jump} counts={counts} theme={theme} setTheme={setTheme} night={night} />
       {promptOpen && !sel && suggest && net && <TrackPrompt t={suggest} line={net.lines.find((l) => l.id === suggest.line)!} onStart={() => ctl.current.track?.(suggest.id)} onShuffle={shuffle} onDismiss={dismissPrompt} />}
-      {!promptOpen && !sel && <TrackHint onRandom={shuffle} />}
+      {!promptOpen && !sel && !selBus && mode !== 'bus' && <TrackHint onRandom={shuffle} />}
+      {mode === 'bus' && !selBus && <div className="glass absolute bottom-2 left-2 px-4 py-2 text-xs text-white/70 sm:bottom-4 sm:left-4">Zoom in and tap any bus to track it</div>}
+      {selBus && mode !== 'metro' && !sel && <BusCard b={selBus} cam={cam} setCam={setCam} close={closeBus} />}
       {sel && selLine && <TrainCard t={sel} line={selLine} cam={cam} setCam={setCam} close={close} />}
       {sel && selLine && <LineStrip line={selLine} t={sel} />}
-      {net && !sel && (
+      {net && !sel && mode !== 'bus' && (
         <div className="glass absolute bottom-2 left-2 flex max-w-[calc(100vw-4.5rem)] flex-wrap gap-x-4 gap-y-1 px-4 py-3 text-xs sm:bottom-4 sm:left-4">
           {net.lines.map((l) => (
             <span key={l.id} className="flex items-center gap-2" style={{ opacity: l.open ? 1 : 0.6 }}>

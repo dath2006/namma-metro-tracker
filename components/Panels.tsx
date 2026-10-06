@@ -1,6 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import type { BusView } from '@/lib/busSim';
 import type { Line, Network } from '@/lib/network';
 import type { TrainState } from '@/lib/engine';
 
@@ -182,6 +183,50 @@ export function TrainCard({ t, line, cam, setCam, close }: { t: TrainState; line
       </div>
       <div className="mt-3 flex items-center justify-between gap-2 text-xs text-white/50">
         <span className="shrink-0">{t.id}</span>
+        <div className="flex gap-1">
+          {CAMS.map((c) => (
+            <button key={c.id} title={c.hint} onClick={() => setCam(c.id)} className={`rounded-md px-2 py-1 ${cam === c.id ? 'bg-white/20 text-white' : 'bg-white/5 hover:bg-white/10'}`}>{c.label}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export type BusSel = BusView & { dist?: number; age: string };
+
+export function BusCard({ b, cam, setCam, close }: { b: BusSel; cam: CamMode; setCam: (c: CamMode) => void; close: () => void }) {
+  const kmh = Math.round(b.speed * 3.6);
+  const color = b.ac ? '#22d3ee' : '#f59e0b';
+  return (
+    <div className="glass absolute bottom-2 left-2 right-16 p-4 sm:bottom-auto sm:left-auto sm:right-4 sm:top-48 sm:w-[21rem]">
+      <div className="flex items-start gap-3">
+        <div className="grid h-10 w-10 place-items-center rounded-xl text-lg" style={{ background: color + '33' }}>🚌</div>
+        <div className="min-w-0 flex-1">
+          <span className="rounded-md px-2 py-0.5 text-xs font-semibold text-black" style={{ background: color }}>{b.route}</span>
+          <div className="mt-1 truncate font-semibold">{b.head ? `Bus to ${b.head}` : 'BMTC bus'}</div>
+          <div className="mt-1 flex items-center gap-2 text-sm text-white/70">
+            {b.sim ? 'Timetable' : b.ac ? 'AC' : 'Ordinary'}
+            <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${kmh ? 'bg-emerald-500/20 text-emerald-300' : 'bg-white/10 text-white/70'}`}>{kmh ? `${kmh} km/h` : 'Stopped'}</span>
+          </div>
+          <div className={`mt-2 inline-block rounded-md px-2 py-1 text-xs font-semibold ${TONE[b.sim ? 'warn' : 'go']}`}>{b.sim ? 'Scheduled estimate · no live GPS' : `Live GPS · ${b.age}`}</div>
+          <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/10">
+            <div className="h-full rounded-full bg-emerald-400 transition-[width] duration-300" style={{ width: `${Math.min(100, (b.speed / (60 / 3.6)) * 100)}%` }} />
+          </div>
+        </div>
+        <button onClick={close} aria-label="Close" className="text-white/50 hover:text-white">✕</button>
+      </div>
+      {b.next && (
+        <div className="mt-3 flex items-end justify-between border-t border-white/10 pt-3">
+          <div className="min-w-0">
+            <div className="text-xs text-white/50">Next stop</div>
+            <div className="truncate font-semibold">{b.next}</div>
+          </div>
+          {b.dist !== undefined && <div className="shrink-0 pl-2 text-sm text-white/70">{b.dist < 1000 ? `${Math.round(b.dist / 10) * 10} m` : `${(b.dist / 1000).toFixed(1)} km`}</div>}
+        </div>
+      )}
+      <div className="mt-3 flex items-center justify-between gap-2 text-xs text-white/50">
+        <span className="shrink-0">{b.reg || 'Scheduled trip'}</span>
         <div className="flex gap-1">
           {CAMS.map((c) => (
             <button key={c.id} title={c.hint} onClick={() => setCam(c.id)} className={`rounded-md px-2 py-1 ${cam === c.id ? 'bg-white/20 text-white' : 'bg-white/5 hover:bg-white/10'}`}>{c.label}</button>
