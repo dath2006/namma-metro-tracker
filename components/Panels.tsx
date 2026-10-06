@@ -193,6 +193,55 @@ export function TrainCard({ t, line, cam, setCam, close }: { t: TrainState; line
   );
 }
 
+export type BusIndexRow = [id: number, no: string, name: string];
+const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, ''); // "500d" finds "500-D"
+
+/** Search over every BMTC route; picking one shows its line and stops and starts its live feed. */
+export function BusSearch({ index, active, onPick, onClear }: { index: BusIndexRow[]; active: { no: string; name: string } | null; onPick: (id: number) => void; onClear: () => void }) {
+  const [q, setQ] = useState('');
+  const keys = useMemo(() => index.map(([, no, name]) => [norm(no), name.toLowerCase()] as const), [index]);
+  const hits = useMemo(() => {
+    const n = norm(q), s = q.trim().toLowerCase();
+    if (!n) return [];
+    const starts: number[] = [], inc: number[] = [], byName: number[] = [];
+    keys.forEach(([k, name], i) => { if (k.startsWith(n)) starts.push(i); else if (k.includes(n)) inc.push(i); else if (name.includes(s)) byName.push(i); });
+    return [...starts, ...inc, ...byName].slice(0, 8);
+  }, [q, keys]);
+  return (
+    <div className="absolute left-2 top-[7.6rem] w-[calc(100vw-1rem)] text-xs sm:left-1/2 sm:top-16 sm:w-80 sm:-translate-x-1/2">
+      <div className="glass flex items-center gap-2 p-1.5">
+        {active ? (
+          <>
+            <span className="rounded-md bg-amber-500 px-2 py-1 font-semibold text-black">{active.no}</span>
+            <span className="min-w-0 flex-1 truncate text-white/70">{active.name}</span>
+            <button onClick={() => { setQ(''); onClear(); }} aria-label="Clear route" className="px-1.5 text-white/50 hover:text-white">✕</button>
+          </>
+        ) : (
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder={index.length ? `Search ${index.length.toLocaleString('en-IN')} bus routes, e.g. 335E` : 'Loading routes…'}
+            aria-label="Bus route"
+            className="min-w-0 flex-1 rounded-md bg-white/5 px-2.5 py-1.5 outline-none placeholder:text-white/40 focus:bg-white/10"
+          />
+        )}
+      </div>
+      {!active && hits.length > 0 && (
+        <ul className="glass mt-1 overflow-hidden py-1">
+          {hits.map((i) => (
+            <li key={index[i][0]}>
+              <button className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-white/10" onClick={() => { setQ(''); onPick(index[i][0]); }}>
+                <span className="shrink-0 rounded-md bg-amber-500/20 px-1.5 py-0.5 font-semibold text-amber-300">{index[i][1]}</span>
+                <span className="truncate text-white/70">{index[i][2]}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export type BusSel = BusView & { dist?: number; age: string };
 
 export function BusCard({ b, cam, setCam, close }: { b: BusSel; cam: CamMode; setCam: (c: CamMode) => void; close: () => void }) {
@@ -209,7 +258,7 @@ export function BusCard({ b, cam, setCam, close }: { b: BusSel; cam: CamMode; se
             {b.sim ? 'Timetable' : b.ac ? 'AC' : 'Ordinary'}
             <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${kmh ? 'bg-emerald-500/20 text-emerald-300' : 'bg-white/10 text-white/70'}`}>{kmh ? `${kmh} km/h` : 'Stopped'}</span>
           </div>
-          <div className={`mt-2 inline-block rounded-md px-2 py-1 text-xs font-semibold ${TONE[b.sim ? 'warn' : 'go']}`}>{b.sim ? 'Scheduled estimate · no live GPS' : `Live GPS · ${b.age}`}</div>
+          <div className={`mt-2 inline-block rounded-md px-2 py-1 text-xs font-semibold ${TONE[b.sim ? 'warn' : 'go']}`}>{b.sim ? 'Scheduled · from the BMTC timetable' : `Live GPS · ${b.age}`}</div>
           <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/10">
             <div className="h-full rounded-full bg-emerald-400 transition-[width] duration-300" style={{ width: `${Math.min(100, (b.speed / (60 / 3.6)) * 100)}%` }} />
           </div>
@@ -222,7 +271,12 @@ export function BusCard({ b, cam, setCam, close }: { b: BusSel; cam: CamMode; se
             <div className="text-xs text-white/50">Next stop</div>
             <div className="truncate font-semibold">{b.next}</div>
           </div>
-          {b.dist !== undefined && <div className="shrink-0 pl-2 text-sm text-white/70">{b.dist < 1000 ? `${Math.round(b.dist / 10) * 10} m` : `${(b.dist / 1000).toFixed(1)} km`}</div>}
+          {b.dist !== undefined && (
+            <div className="shrink-0 pl-2 text-right text-sm text-white/70">
+              {b.dist < 1000 ? `${Math.round(b.dist / 10) * 10} m` : `${(b.dist / 1000).toFixed(1)} km`}
+              {b.eta ? <div className="text-xs">{b.eta < 90 ? 'Arriving' : `~ ${Math.round(b.eta / 60)} min`}</div> : <div className="text-xs">At stop</div>}
+            </div>
+          )}
         </div>
       )}
       <div className="mt-3 flex items-center justify-between gap-2 text-xs text-white/50">
